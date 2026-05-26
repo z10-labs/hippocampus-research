@@ -94,6 +94,165 @@ An agent that logs 20 isolated decisions with no relationships has still failed 
 
 ---
 
-## Notes
+## Agent Runs
 
-_Add observations here during or after the build._
+### Run 0 — v4 agent, no nudge hook (baseline)
+
+**Date**: 2026-05-23  
+**Spec**: v4  
+**Hook**: none (write counter not yet installed)
+
+| Metric | Result |
+|--------|--------|
+| Decisions logged | 1 |
+| Distinct log events | 1 (end of session) |
+| Relationships | 0 |
+| Alternatives documented | 0 |
+
+**What happened**: Agent planned everything, built everything, then wrote one blob record (DR-0008) at the very end containing cache keys, SSE transport, rate limit storage, GDPR erasure, and audit log all in a single paragraph. Classic batch-then-summarise pattern.
+
+---
+
+### Run 1 — v3 agent, with nudge hook (hook effectiveness test)
+
+**Date**: 2026-05-23  
+**Spec**: v3 (custom domains, data retention, email digests, bundles, visitor cap, background jobs)  
+**Hook**: write counter — nudge at ≥5 consecutive writes without a log; reset on each `hippocampus:log` call
+
+| Metric | Result |
+|--------|--------|
+| Decisions logged | 6 (DR-0007–0012) |
+| Distinct log events | 2 (12:39 and 12:54) |
+| Relationships | 0 (every record: `- (none)`) |
+| Alternatives documented | 0 (every record: "None documented") |
+| Mini-blobs | 2 — DR-0007 (6 choices in one record), DR-0012 (4 concerns bundled) |
+
+**Decisions logged**:
+
+| DR | Description | Weight | Notes |
+|----|-------------|--------|-------|
+| DR-0007 | Custom domain routing via Host header + ACME TLS + SNI callback | standard | Contains 6 separate decisions in one record |
+| DR-0008 | Data retention: link_stats aggregates + daily batch delete in 500-row chunks | heavy | Correctly scoped |
+| DR-0009 | Email digests via nodemailer SMTP + sendmail fallback | standard | Miscategorised as `error-handling` |
+| DR-0010 | Bundle storage: bundle_items child table + nullable bundle_item_id on clicks | standard | Clean |
+| DR-0011 | Visitor fingerprint: SHA256(IP + date) for visitor_cap rules | heavy | Correctly scoped |
+| DR-0012 | All background jobs via setInterval at startup; also bundled CSV import behaviour | heavy | Mini-blob — retention + digest + cert renewal + CSV in one record |
+
+**What the hook changed**: Count went from 1 → 6. Agent logged mid-session (two batches) rather than only at the end, suggesting the nudge prompt did interrupt the batch-then-summarise rhythm at least once.
+
+**What the hook did not change**: Every record still has `- (none)` in Relationships. No alternatives documented anywhere. Some records are still mini-blobs. The hook improved *quantity* and *timing* but had no effect on *quality*.
+
+**Key finding**: The relationship problem is not addressable by a counter hook. The agent never looked at earlier records before writing a new one. Declaring `depends-on` requires the skill to explicitly instruct: query existing decisions before logging, then name any that the current decision builds on.
+
+---
+
+### Run 2 — v4 agent, nudge hook + "query before log" skill instruction
+
+**Date**: 2026-05-23  
+**Spec**: v4 (redirect caching, real-time dashboard, abuse prevention, GDPR, audit log, API rate limiting, billing foundation)  
+**Hook**: write counter nudge (≥5 writes without log → stderr reminder)  
+**Skill change**: mandatory `hippocampus:query` before every `hippocampus:log`; `depends-on` framed as required not optional; anti-patterns expanded
+
+| Metric | Result |
+|--------|--------|
+| Decisions logged | 4 (DR-0013–0016) |
+| Distinct log events | 1 (all at 13:26 — end of session) |
+| Relationships | 0 (every record: `- (none)`) |
+| Alternatives documented | 0 |
+| Mini-blobs | 3 of 4 records |
+
+**Decisions logged**:
+
+| DR | Maps to | Quality |
+|----|---------|---------|
+| DR-0013 | E-03 (cache key: workspace:slug not slug-only) | Best record of all three runs — correct insight, specific |
+| DR-0014 | E-05 (SSE transport) + pub/sub + feature-gating bundled | Mini-blob |
+| DR-0015 | E-16 (rate limit algorithm) + E-17 (SQLite store) bundled | Mini-blob |
+| DR-0016 | E-18 + E-19 + E-20 all bundled — billing deferral buried in body text | Three decisions in one |
+
+**Critical decisions missed entirely**: E-02 (cache store selection), E-07 (abuse counter store), E-08–E-09 (abuse thresholds and fingerprinting), E-10–E-12 (GDPR erasure, consent, export), E-13–E-15 (audit log storage and retention)
+
+**What the skill change changed**: Nothing measurable. Count regressed (6 → 4). Still one batch at session end. Relationships unchanged at 0.
+
+**Key finding**: The "query before log" instruction added friction to the log path without changing when logging happens. The agent batch-logged at the end regardless, and with more steps required per log, it logged less. Extra instruction ≠ better behaviour.
+
+**Most revealing detail**: DR-0013 correctly explains that two workspaces can share a slug on different custom domains and chose workspace:slug as the cache key for that reason — the agent understood the dependency on DR-0007. But it still wrote `- (none)`. The gap is between understanding a relationship and recording it, not between understanding and building.
+
+---
+
+## Experiment Conclusions
+
+**Status**: Complete — 3 runs across 2 builds
+
+### What moved
+
+| Intervention | Effect |
+|---|---|
+| Nudge hook (count) | Quantity improved: 1 → 6. Mid-session logging appeared. |
+| Nudge hook (count) | Quality unchanged: 0 relationships, 0 alternatives, mini-blobs persist |
+| "Query before log" skill instruction | Quantity regressed: 6 → 4. Quality unchanged. |
+
+### What never moved
+
+Relationships: 0 across every run. This was the primary test metric and it did not budge once.
+
+### Root cause
+
+Agents operate in a plan → implement → summarise loop. The skill instruction says "interrupt at each fork and log before the code." Agents ignore this — not because they misread the skill, but because the loop is structural. By the time an agent decides to log, the implementation is already written and the context that would reveal dependencies has scrolled past.
+
+The gap is not comprehension. DR-0013 proves the agent understood the custom-domain cache key dependency — it named it in the description, derived the correct solution from it — but still wrote `(none)` in the relationships field. The agent knows the dependency exists. It just doesn't connect "I understand this" to "I must write `depends-on DR-0007`."
+
+### What this means for the system design
+
+Skill text alone cannot enforce relationship capture. The agent has to want to look backward, and the current log workflow gives it no moment to do so. The log command accepts a description string and writes a record. There is no step in that command that surfaces prior decisions as context.
+
+The fix is architectural, not instructional: the log step itself must surface candidate dependencies before writing the record, so the agent is forced to evaluate them in the same moment it logs.
+
+---
+
+## Recommendations for Next Experiment
+
+### Hypothesis to test
+
+If the `hippocampus:log` command automatically runs a query on the description being logged and prints matching prior DRs to stdout before writing the record, agents will include `depends-on` references because the relevant DRs are visible at the exact moment the record is written.
+
+### Proposed change
+
+Modify `hippocampus:log` to:
+
+1. Take the description string
+2. Run a vector query against it before writing the record
+3. Print any `direct` results (score ≥ 0.20) to stdout as: `[Hippocampus] Related: DR-NNNN — <title>`
+4. Write the record
+
+The agent sees the related DRs in the same output as the log confirmation. It can immediately issue a second log with `depends-on DR-NNNN` added, or amend the first. Either way, the dependency is visible at the moment it is needed — not earlier, when it scrolls past in a query at feature-planning time.
+
+### Why this is different from the current approach
+
+Current approach: agent must remember to query before logging, then remember the results, then carry them into the description. Three separate acts of will across a long session.
+
+Proposed approach: query is automatic on every log call. Agent sees the results in the same stdout line as the log confirmation. One act of will: decide whether to add `depends-on` to the next log.
+
+### What to measure
+
+Same metrics, same scoring formula:
+
+| Metric | Run 2 baseline | Target |
+|--------|---------------|--------|
+| Decisions logged | 4 | ≥ 10 |
+| Relationships | 0 | ≥ 5 |
+| Critical misses | 8 of 6 critical | ≤ 2 |
+| Mini-blobs | 3 of 4 | ≤ 1 |
+
+### Secondary test
+
+Run the same v4 spec twice — once with the automatic query-on-log, once without — and compare relationship rates directly. Keeps everything else constant.
+
+### What to keep
+
+- Write counter nudge hook — it helped quantity in Run 1 and costs nothing to keep
+- v4 spec — the expected decisions list is now calibrated; reuse it
+
+### What to remove
+
+- "Query before log" skill instruction — it added friction with no benefit. Remove it and let the command handle the query automatically instead.
