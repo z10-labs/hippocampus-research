@@ -532,3 +532,76 @@ if (passiveRejected && !/^(this|the|it|a|an|that)\b/i.test(passiveRejected[1])) 
 ### Success criteria (stopping condition)
 
 ≥ 3 records where both Relationships AND Alternatives fields are non-empty. Loop ends on first run that meets this.
+
+### Actual Decisions Logged (3.7)
+
+Agent built F-13 (DLQ Replay) on top of the existing v6 codebase. Three standard records written, none deferred.
+
+| DR | Maps to | Relationships field | Alternatives field | Notes |
+|----|---------|--------------------|--------------------|-------|
+| DR-0019 | Replay identity model: new row + `replayed` status | `DR-0001, DR-0006` | `- because the audit log` / `- Reusing the same job ID` / `- because it duplicates...` / `- Cloning rows into a separate replay_queue table` | Passive pattern extracted 2 correct names. Active pattern also fired on same sentences and produced 2 reason fragments. Net: 4 entries, 2 correct |
+| DR-0020 | Bulk replay: single transaction | `DR-0001, DR-0019` | `- because partial success is confusing...` / `- Individual inserts in a loop` / `- individual inserts because...` | Passive captured "Individual inserts in a loop" ✅. Active fired on same sentence and produced reason fragment. DR-0019 linked mid-session (virtuous cycle again) |
+| DR-0021 | Audit write path: one event per job | `DR-0006, DR-0010, DR-0020` | `- a direct index lookup on job_id...` / `- because querying 'when was job X replayed?'...` / `- le batched audit event...` / `- a batched write because...` | Mixed: 1 correct name, 1 truncated (regex cutting mid-word into "le batched..."), 2 reason fragments. DR-0020 linked mid-session |
+
+### Scoring (3.7)
+
+| Metric | 3.5 | 3.6 | 3.7 | Target |
+|--------|-----|-----|-----|--------|
+| New records (not deferred) | 3 | 2 | **3** | 3 |
+| Relationships in structured field (new) | 8 | 4 | **7** | ≥ 3 |
+| Alternatives non-empty | 0 | 2 | **3** | ≥ 3 |
+| Alternatives with ≥ 1 correct name | 0 | 1 | **3** | ≥ 3 |
+| Records with both fields non-empty | 0 | 1 | **3** | ≥ 3 ✅ |
+| **Stopping condition met** | no | no | **YES** | ≥ 3 |
+
+### Key Observations (3.7)
+
+**1. Stopping condition met: 3/3 records have both fields non-empty.**
+Every record produced this run has at least one correctly-named rejected alternative and at least one structured depends-on link. This is the first run to achieve full coverage across all records.
+
+**2. Passive voice pattern works — but creates noise when active pattern fires on the same sentence.**
+"Individual inserts in a loop are rejected because..." — passive captures "Individual inserts in a loop" ✅. But the active `\brejected\s+([^...]+)` also fires on the same sentence, matching "rejected because partial success is confusing..." and extracting "because partial success is confusing" as an additional entry. The result is one correct entry + one reason fragment per sentence. The fix is to suppress the active pattern when passive has already matched the sentence.
+
+**3. Cross-session virtuous cycle confirmed again at 3 levels.**
+DR-0021 depends on DR-0020 which was logged minutes earlier in the same session. `buildIndex(false)` + `surfaceRelated()` chained correctly: DR-0019 indexed → DR-0020 surfaced and linked to it → DR-0021 surfaced and linked to DR-0020. Three records, each depending on the previous, in a single session.
+
+**4. "Deferred" vocabulary no longer triggered deferral.**
+Spec v7 avoided option labels containing the word "deferred". All three forks produced standard records. The fix worked.
+
+**5. Truncation artifact: "le batched audit event...".**
+The regex `[\w][\w\s-]{2,50}?` is lazy-minimum. For a long subject like "a single batched audit event listing all replayed job IDs", the lazy quantifier may match a minimal sub-sequence that still satisfies the overall pattern, producing a fragment mid-word. The `{2,50}?` cap is causing partial name capture when subjects are long noun phrases.
+
+### What We Learned (3.7)
+
+**The stopping condition is met but Alternatives quality is mixed.** Each record has ≥ 1 correct alternative name, but also carries noise: reason fragments ("because Y") produced by the active pattern firing on the same sentence as the passive pattern. The structured field is useful — it contains the right names — but requires filtering to be clean.
+
+**Two remaining extraction quality issues for future work:**
+1. Suppress active-pattern extraction when the passive pattern already fired for the same sentence
+2. Fix truncation for long noun-phrase subjects (increase cap, or use a different length bound)
+
+**The core system works.** Relationships are accurate and growing. Alternatives are non-empty with correct names. The virtuous cycle is stable across every run. The graph now has 21 records, multi-session depth, and cross-feature provenance chains.
+
+---
+
+## Experiment Series Summary
+
+The poc-003 series ran 7 experiments over specs v1–v7, building Forge features F-01 through F-13.
+
+| Experiment | Change | Outcome |
+|------------|--------|---------|
+| 3.1 | Auto-query-on-log (`surfaceRelated`) | First `depends-on` token ever in prose |
+| 3.2 | Sentence-level relationship extraction | First structured Relationships field |
+| 3.3 | Incremental re-index after each log | Virtuous cycle confirmed, 3-level chains |
+| 3.4 | `fails`/`allows`/`requires` patterns | First Alternatives entry (1/3 records) |
+| 3.5 | — (diagnosis only) | Confirmed "rejected X" is dominant missing pattern |
+| 3.6 | `rejected X` active pattern | 1/2 records with both fields (passive form missed) |
+| 3.7 | Passive `X is rejected` pattern + spec vocabulary fix | **3/3 records with both fields** — stopping condition met |
+
+**Total decision records across all runs**: 21 (DR-0001 through DR-0021)
+**Deepest dependency chain**: DR-0021 → DR-0020 → DR-0019 → DR-0006 → DR-0001 (5 levels)
+
+### Remaining known quality issues (not blocking)
+
+1. Active pattern produces reason fragments when passive pattern fires on same sentence
+2. Long noun-phrase subjects may be truncated mid-word by the `{2,50}?` cap
+3. Heavy records ("Alternatives Considered") and standard records ("Alternatives Skipped") use different section names — both are populated correctly, but section naming is inconsistent
